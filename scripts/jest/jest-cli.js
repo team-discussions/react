@@ -5,6 +5,7 @@ const chalk = require('chalk');
 const yargs = require('yargs');
 const fs = require('fs');
 const path = require('path');
+const semver = require('semver');
 
 const ossConfig = './scripts/jest/config.source.js';
 const wwwConfig = './scripts/jest/config.source-www.js';
@@ -97,6 +98,24 @@ const argv = yargs
       requiresArg: true,
       type: 'string',
     },
+    compactConsole: {
+      alias: 'c',
+      describe: 'Compact console output (hide file locations).',
+      requiresArg: false,
+      type: 'boolean',
+      default: false,
+    },
+    reactVersion: {
+      describe: 'DevTools testing for specific version of React',
+      requiresArg: true,
+      type: 'string',
+    },
+    sourceMaps: {
+      describe:
+        'Enable inline source maps when transforming source files with Jest. Useful for debugging, but makes it slower.',
+      type: 'boolean',
+      default: false,
+    },
   }).argv;
 
 function logError(message) {
@@ -157,6 +176,20 @@ function validateOptions() {
 
     if (!argv.build) {
       logError('DevTool tests require --build.');
+      success = false;
+    }
+
+    if (argv.reactVersion && !semver.validRange(argv.reactVersion)) {
+      success = false;
+      logError('please specify a valid version range for --reactVersion');
+    }
+  } else {
+    if (argv.compactConsole) {
+      logError('Only DevTool tests support compactConsole flag.');
+      success = false;
+    }
+    if (argv.reactVersion) {
+      logError('Only DevTools tests supports the --reactVersion flag.');
       success = false;
     }
   }
@@ -284,6 +317,10 @@ function getEnvars() {
     RELEASE_CHANNEL: argv.releaseChannel.match(/modern|experimental/)
       ? 'experimental'
       : 'stable',
+
+    // Pass this flag through to the config environment
+    // so the base config can conditionally load the console setup file.
+    compactConsole: argv.compactConsole,
   };
 
   if (argv.prod) {
@@ -298,6 +335,16 @@ function getEnvars() {
     envars.VARIANT = true;
   }
 
+  if (argv.reactVersion) {
+    envars.REACT_VERSION = semver.coerce(argv.reactVersion);
+  }
+
+  if (argv.sourceMaps) {
+    // This is off by default because it slows down the test runner, but it's
+    // super useful when running the debugger.
+    envars.JEST_ENABLE_SOURCE_MAPS = 'inline';
+  }
+
   return envars;
 }
 
@@ -306,7 +353,9 @@ function main() {
     console.log(chalk.red(`\nPlease run: \`${argv.deprecated}\` instead.\n`));
     return;
   }
+
   validateOptions();
+
   const args = getCommandArgs();
   const envars = getEnvars();
   const env = Object.entries(envars).map(([k, v]) => `${k}=${v}`);
@@ -334,6 +383,7 @@ function main() {
     stdio: 'inherit',
     env: {...envars, ...process.env},
   });
+
   // Ensure we close our process when we get a failure case.
   jest.on('close', code => {
     // Forward the exit code from the Jest process.

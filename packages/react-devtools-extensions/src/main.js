@@ -1,11 +1,13 @@
 /* global chrome */
 
 import {createElement} from 'react';
-import {createRoot, flushSync} from 'react-dom';
+import {flushSync} from 'react-dom';
+import {createRoot} from 'react-dom/client';
 import Bridge from 'react-devtools-shared/src/bridge';
 import Store from 'react-devtools-shared/src/devtools/store';
 import {getBrowserName, getBrowserTheme} from './utils';
 import {LOCAL_STORAGE_TRACE_UPDATES_ENABLED_KEY} from 'react-devtools-shared/src/constants';
+import {registerDevToolsEventLogger} from 'react-devtools-shared/src/registerDevToolsEventLogger';
 import {
   getAppendComponentStack,
   getBreakOnConsoleErrors,
@@ -18,14 +20,39 @@ import {
   localStorageRemoveItem,
   localStorageSetItem,
 } from 'react-devtools-shared/src/storage';
-import {registerEventLogger} from 'react-devtools-shared/src/Logger';
 import DevTools from 'react-devtools-shared/src/devtools/views/DevTools';
 import {__DEBUG__} from 'react-devtools-shared/src/constants';
+import {logEvent} from 'react-devtools-shared/src/Logger';
 
 const LOCAL_STORAGE_SUPPORTS_PROFILING_KEY =
   'React::DevTools::supportsProfiling';
 
 const isChrome = getBrowserName() === 'Chrome';
+const isEdge = getBrowserName() === 'Edge';
+
+// since Chromium v102, requestAnimationFrame no longer fires in devtools_page (i.e. this file)
+// mock requestAnimationFrame with setTimeout as a temporary workaround
+// https://github.com/facebook/react/issues/24626
+if (isChrome || isEdge) {
+  const timeoutID = setTimeout(() => {
+    // if requestAnimationFrame is not working, polyfill it
+    // The polyfill is based on https://gist.github.com/jalbam/5fe05443270fa6d8136238ec72accbc0
+    const FRAME_TIME = 16;
+    let lastTime = 0;
+    window.requestAnimationFrame = function(callback, element) {
+      const now = window.performance.now();
+      const nextTime = Math.max(lastTime + FRAME_TIME, now);
+      return setTimeout(function() {
+        callback((lastTime = nextTime));
+      }, nextTime - now);
+    };
+    window.cancelAnimationFrame = clearTimeout;
+  }, 400);
+
+  requestAnimationFrame(() => {
+    clearTimeout(timeoutID);
+  });
+}
 
 let panelCreated = false;
 
@@ -88,13 +115,11 @@ function createPanelIfReactLoaded() {
 
       const tabId = chrome.devtools.inspectedWindow.tabId;
 
-      registerEventLogger((event: LogEvent) => {
-        // TODO: hook up event logging
-      });
+      registerDevToolsEventLogger('extension');
 
       function initBridgeAndStore() {
         const port = chrome.runtime.connect({
-          name: '' + tabId,
+          name: String(tabId),
         });
         // Looks like `port.onDisconnect` does not trigger on in-tab navigation like new URL or back/forward navigation,
         // so it makes no sense to handle it here.
@@ -150,13 +175,15 @@ function createPanelIfReactLoaded() {
 
         store = new Store(bridge, {
           isProfiling,
-          supportsReloadAndProfile: isChrome,
+          supportsReloadAndProfile: isChrome || isEdge,
           supportsProfiling,
-          // At this time, the scheduling profiler can only parse Chrome performance profiles.
-          supportsSchedulingProfiler: isChrome,
+          // At this time, the timeline can only parse Chrome performance profiles.
+          supportsTimeline: isChrome,
           supportsTraceUpdates: true,
         });
-        store.profilerStore.profilingData = profilingData;
+        if (!isProfiling) {
+          store.profilerStore.profilingData = profilingData;
+        }
 
         // Initialize the backend only once the Store has been initialized.
         // Otherwise the Store may miss important initial tree op codes.
@@ -451,6 +478,7 @@ function createPanelIfReactLoaded() {
               ensureInitialHTMLIsCleared(componentsPortalContainer);
               render('components');
               panel.injectStyles(cloneStyleTags);
+              logEvent({event_name: 'selected-components-tab'});
             }
           });
           extensionPanel.onHidden.addListener(panel => {
@@ -476,6 +504,7 @@ function createPanelIfReactLoaded() {
               ensureInitialHTMLIsCleared(profilerPortalContainer);
               render('profiler');
               panel.injectStyles(cloneStyleTags);
+              logEvent({event_name: 'selected-profiler-tab'});
             }
           });
         },

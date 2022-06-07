@@ -9,13 +9,12 @@
  */
 
 import type {BrowserTheme} from 'react-devtools-shared/src/devtools/views/DevTools';
+import type {DevToolsHook} from 'react-devtools-shared/src/backend/types';
 
 import {
   patch as patchConsole,
   registerRenderer as registerRendererWithConsole,
 } from './backend/console';
-
-import type {DevToolsHook} from 'react-devtools-shared/src/backend/types';
 
 declare var window: any;
 
@@ -173,60 +172,45 @@ export function installHook(target: any): DevToolsHook | null {
   }
 
   // NOTE: KEEP IN SYNC with src/backend/utils.js
-  function format(
-    maybeMessage: any,
-    ...inputArgs: $ReadOnlyArray<any>
-  ): string {
-    const args = inputArgs.slice();
-
-    // Symbols cannot be concatenated with Strings.
-    let formatted: string =
-      typeof maybeMessage === 'symbol'
-        ? maybeMessage.toString()
-        : '' + maybeMessage;
-
-    // If the first argument is a string, check for substitutions.
-    if (typeof maybeMessage === 'string') {
-      if (args.length) {
-        const REGEXP = /(%?)(%([jds]))/g;
-
-        formatted = formatted.replace(REGEXP, (match, escaped, ptn, flag) => {
-          let arg = args.shift();
-          switch (flag) {
-            case 's':
-              arg += '';
-              break;
-            case 'd':
-            case 'i':
-              arg = parseInt(arg, 10).toString();
-              break;
-            case 'f':
-              arg = parseFloat(arg).toString();
-              break;
-          }
-          if (!escaped) {
-            return arg;
-          }
-          args.unshift(arg);
-          return match;
-        });
-      }
+  function formatWithStyles(
+    inputArgs: $ReadOnlyArray<any>,
+    style?: string,
+  ): $ReadOnlyArray<any> {
+    if (
+      inputArgs === undefined ||
+      inputArgs === null ||
+      inputArgs.length === 0 ||
+      // Matches any of %c but not %%c
+      (typeof inputArgs[0] === 'string' &&
+        inputArgs[0].match(/([^%]|^)(%c)/g)) ||
+      style === undefined
+    ) {
+      return inputArgs;
     }
 
-    // Arguments that remain after formatting.
-    if (args.length) {
-      for (let i = 0; i < args.length; i++) {
-        const arg = args[i];
-
-        // Symbols cannot be concatenated with Strings.
-        formatted += ' ' + (typeof arg === 'symbol' ? arg.toString() : arg);
-      }
+    // Matches any of %(o|O|d|i|s|f), but not %%(o|O|d|i|s|f)
+    const REGEXP = /([^%]|^)((%%)*)(%([oOdisf]))/g;
+    if (typeof inputArgs[0] === 'string' && inputArgs[0].match(REGEXP)) {
+      return [`%c${inputArgs[0]}`, style, ...inputArgs.slice(1)];
+    } else {
+      const firstArg = inputArgs.reduce((formatStr, elem, i) => {
+        if (i > 0) {
+          formatStr += ' ';
+        }
+        switch (typeof elem) {
+          case 'string':
+          case 'boolean':
+          case 'symbol':
+            return (formatStr += '%s');
+          case 'number':
+            const formatting = Number.isInteger(elem) ? '%i' : '%f';
+            return (formatStr += formatting);
+          default:
+            return (formatStr += '%o');
+        }
+      }, '%c');
+      return [firstArg, style, ...inputArgs];
     }
-
-    // Update escaped %% values.
-    formatted = formatted.replace(/%{2,2}/g, '%');
-
-    return '' + formatted;
   }
 
   let unpatchFn = null;
@@ -298,7 +282,7 @@ export function installHook(target: any): DevToolsHook | null {
             }
 
             if (color) {
-              originalMethod(`%c${format(...args)}`, `color: ${color}`);
+              originalMethod(...formatWithStyles(args, `color: ${color}`));
             } else {
               throw Error('Console color is not defined');
             }
@@ -496,6 +480,40 @@ export function installHook(target: any): DevToolsHook | null {
     }
   }
 
+  type StackFrameString = string;
+
+  const openModuleRangesStack: Array<StackFrameString> = [];
+  const moduleRanges: Array<[StackFrameString, StackFrameString]> = [];
+
+  function getTopStackFrameString(error: Error): StackFrameString | null {
+    const frames = error.stack.split('\n');
+    const frame = frames.length > 1 ? frames[1] : null;
+    return frame;
+  }
+
+  function getInternalModuleRanges(): Array<
+    [StackFrameString, StackFrameString],
+  > {
+    return moduleRanges;
+  }
+
+  function registerInternalModuleStart(error: Error) {
+    const startStackFrame = getTopStackFrameString(error);
+    if (startStackFrame !== null) {
+      openModuleRangesStack.push(startStackFrame);
+    }
+  }
+
+  function registerInternalModuleStop(error: Error) {
+    if (openModuleRangesStack.length > 0) {
+      const startStackFrame = openModuleRangesStack.pop();
+      const stopStackFrame = getTopStackFrameString(error);
+      if (stopStackFrame !== null) {
+        moduleRanges.push([startStackFrame, stopStackFrame]);
+      }
+    }
+  }
+
   // TODO: More meaningful names for "rendererInterfaces" and "renderers".
   const fiberRoots = {};
   const rendererInterfaces = new Map();
@@ -526,6 +544,13 @@ export function installHook(target: any): DevToolsHook | null {
     onCommitFiberRoot,
     onPostCommitFiberRoot,
     setStrictMode,
+
+    // Schedule Profiler runtime helpers.
+    // These internal React modules to report their own boundaries
+    // which in turn enables the profiler to dim or filter internal frames.
+    getInternalModuleRanges,
+    registerInternalModuleStart,
+    registerInternalModuleStop,
   };
 
   if (__TEST__) {
